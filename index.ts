@@ -21,6 +21,7 @@ import { createScopeManager } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
+import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { AccessTracker } from "./src/access-tracker.js";
 import { createMemoryCLI } from "./cli.js";
@@ -72,6 +73,7 @@ interface PluginConfig {
   };
   enableManagementTools?: boolean;
   sessionStrategy?: SessionStrategy;
+  sessionMemory?: { enabled?: boolean; messageCount?: number };
   selfImprovement?: {
     enabled?: boolean;
     beforeResetNote?: boolean;
@@ -90,6 +92,7 @@ interface PluginConfig {
     errorReminderMaxEntries?: number;
     dedupeErrorSignals?: boolean;
   };
+  mdMirror?: { enabled?: boolean; dir?: string };
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -1037,6 +1040,92 @@ async function findPreviousSessionFile(
 }
 
 // ============================================================================
+// Markdown Mirror (dual-write)
+// ============================================================================
+
+type AgentWorkspaceMap = Record<string, string>;
+
+function resolveAgentWorkspaceMap(api: OpenClawPluginApi): AgentWorkspaceMap {
+  const map: AgentWorkspaceMap = {};
+
+  // Try api.config first (runtime config)
+  const agents = Array.isArray((api as any).config?.agents?.list)
+    ? (api as any).config.agents.list
+    : [];
+
+  for (const agent of agents) {
+    if (agent?.id && typeof agent.workspace === "string") {
+      map[String(agent.id)] = agent.workspace;
+    }
+  }
+
+  // Fallback: read from openclaw.json (respect OPENCLAW_HOME if set)
+  if (Object.keys(map).length === 0) {
+    try {
+      const openclawHome = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
+      const configPath = join(openclawHome, "openclaw.json");
+      const raw = readFileSync(configPath, "utf8");
+      const parsed = JSON.parse(raw);
+      const list = parsed?.agents?.list;
+      if (Array.isArray(list)) {
+        for (const agent of list) {
+          if (agent?.id && typeof agent.workspace === "string") {
+            map[String(agent.id)] = agent.workspace;
+          }
+        }
+      }
+    } catch {
+      /* silent */
+    }
+  }
+
+  return map;
+}
+
+function createMdMirrorWriter(
+  api: OpenClawPluginApi,
+  config: PluginConfig,
+): MdMirrorWriter | null {
+  if (config.mdMirror?.enabled !== true) return null;
+
+  const fallbackDir = api.resolvePath(config.mdMirror.dir || "memory-md");
+  const workspaceMap = resolveAgentWorkspaceMap(api);
+
+  if (Object.keys(workspaceMap).length > 0) {
+    api.logger.info(
+      `mdMirror: resolved ${Object.keys(workspaceMap).length} agent workspace(s)`,
+    );
+  } else {
+    api.logger.warn(
+      `mdMirror: no agent workspaces found, writes will use fallback dir: ${fallbackDir}`,
+    );
+  }
+
+  return async (entry, meta) => {
+    try {
+      const ts = new Date(entry.timestamp || Date.now());
+      const dateStr = ts.toISOString().split("T")[0];
+
+      let mirrorDir = fallbackDir;
+      if (meta?.agentId && workspaceMap[meta.agentId]) {
+        mirrorDir = join(workspaceMap[meta.agentId], "memory");
+      }
+
+      const filePath = join(mirrorDir, `${dateStr}.md`);
+      const agentLabel = meta?.agentId ? ` agent=${meta.agentId}` : "";
+      const sourceLabel = meta?.source ? ` source=${meta.source}` : "";
+      const safeText = entry.text.replace(/\n/g, " ").slice(0, 500);
+      const line = `- ${ts.toISOString()} [${entry.category}:${entry.scope}]${agentLabel}${sourceLabel} ${safeText}\n`;
+
+      await mkdir(mirrorDir, { recursive: true });
+      await appendFile(filePath, line, "utf8");
+    } catch (err) {
+      api.logger.warn(`mdMirror: write failed: ${String(err)}`);
+    }
+  };
+}
+
+// ============================================================================
 // Version
 // ============================================================================
 
@@ -1363,6 +1452,12 @@ const memoryLanceDBProPlugin = {
     );
 
     // ========================================================================
+    // Markdown Mirror
+    // ========================================================================
+
+    const mdMirror = createMdMirrorWriter(api, config);
+
+    // ========================================================================
     // Register Tools
     // ========================================================================
 
@@ -1375,6 +1470,7 @@ const memoryLanceDBProPlugin = {
         embedder,
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
+        mdMirror,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -1562,9 +1658,17 @@ const memoryLanceDBProPlugin = {
             const vector = await embedder.embedPassage(text);
 
             // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-            const existing = await store.vectorSearch(vector, 1, 0.1, [
-              defaultScope,
-            ]);
+            // Fail-open by design: dedup should not block auto-capture writes.
+            let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            try {
+              existing = await store.vectorSearch(vector, 1, 0.1, [
+                defaultScope,
+              ]);
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: auto-capture duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
 
             if (existing.length > 0 && existing[0].score > 0.95) {
               continue;
@@ -1578,6 +1682,14 @@ const memoryLanceDBProPlugin = {
               scope: defaultScope,
             });
             stored++;
+
+            // Dual-write to Markdown mirror if enabled
+            if (mdMirror) {
+              await mdMirror(
+                { text, category, scope: defaultScope, timestamp: Date.now() },
+                { source: "auto-capture", agentId },
+              );
+            }
           }
 
           if (stored > 0) {
@@ -2285,6 +2397,30 @@ function parsePluginConfig(value: unknown): PluginConfig {
         errorReminderMaxEntries: DEFAULT_REFLECTION_ERROR_REMINDER_MAX_ENTRIES,
         dedupeErrorSignals: DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS,
       },
+    sessionMemory:
+      typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
+        ? {
+            enabled:
+              (cfg.sessionMemory as Record<string, unknown>).enabled !== false,
+            messageCount:
+              typeof (cfg.sessionMemory as Record<string, unknown>)
+                .messageCount === "number"
+                ? ((cfg.sessionMemory as Record<string, unknown>)
+                    .messageCount as number)
+                : undefined,
+          }
+        : undefined,
+    mdMirror:
+      typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
+        ? {
+            enabled:
+              (cfg.mdMirror as Record<string, unknown>).enabled === true,
+            dir:
+              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
+                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
+                : undefined,
+          }
+        : undefined,
   };
 }
 
