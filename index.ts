@@ -360,6 +360,7 @@ function getExtensionApiImportSpecifiers(): string[] {
 
   specifiers.push(toImportSpecifier("/usr/lib/node_modules/openclaw/dist/extensionAPI.js"));
   specifiers.push(toImportSpecifier("/usr/local/lib/node_modules/openclaw/dist/extensionAPI.js"));
+  specifiers.push(toImportSpecifier("/opt/homebrew/lib/node_modules/openclaw/dist/extensionAPI.js"));
 
   return [...new Set(specifiers.filter(Boolean))];
 }
@@ -2075,6 +2076,7 @@ const memoryLanceDBProPlugin = {
     // Auto-recall: inject relevant memories before agent starts
     // Default is OFF to prevent the model from accidentally echoing injected context.
     if (config.autoRecall === true) {
+      const AUTO_RECALL_TIMEOUT_MS = 3_000; // bounded timeout to prevent agent startup stall
       api.on("before_agent_start", async (event, ctx) => {
         if (
           !event.prompt ||
@@ -2088,13 +2090,31 @@ const memoryLanceDBProPlugin = {
         const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
         turnCounter.set(sessionId, currentTurn);
 
-        try {
+        // Wrap the entire recall pipeline in a timeout so slow embedding/rerank
+        // API calls cannot stall agent startup indefinitely.  Without this guard
+        // the session lock is held for the full duration of the retrieval chain
+        // (embedding → rerank → lifecycle), which can silently drop messages on
+        // channels like Telegram when subsequent requests hit lock timeouts.
+        // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
+        const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
+          // FR-04: Truncate long prompts (e.g. file attachments) before embedding.
+          // Auto-recall only needs the user's intent, not full attachment text.
+          const MAX_RECALL_QUERY_LENGTH = 1_000;
+          let recallQuery = event.prompt;
+          if (recallQuery.length > MAX_RECALL_QUERY_LENGTH) {
+            const originalLength = recallQuery.length;
+            recallQuery = recallQuery.slice(0, MAX_RECALL_QUERY_LENGTH);
+            api.logger.info(
+              `memory-lancedb-pro: auto-recall query truncated from ${originalLength} to ${MAX_RECALL_QUERY_LENGTH} chars`
+            );
+          }
+
           const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry({
-            query: event.prompt,
+            query: recallQuery,
             limit: 3,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
@@ -2167,6 +2187,21 @@ const memoryLanceDBProPlugin = {
               `[END UNTRUSTED DATA]\n` +
               `</relevant-memories>`,
           };
+        };
+
+        try {
+          const result = await Promise.race([
+            recallWork(),
+            new Promise<undefined>((resolve) =>
+              setTimeout(() => {
+                api.logger.warn(
+                  `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
+                );
+                resolve(undefined);
+              }, AUTO_RECALL_TIMEOUT_MS),
+            ),
+          ]);
+          return result;
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: recall failed: ${String(err)}`);
         }
@@ -2175,11 +2210,22 @@ const memoryLanceDBProPlugin = {
 
     // Auto-capture: analyze and store important information after agent ends
     if (config.autoCapture !== false) {
-      api.on("agent_end", async (event, ctx) => {
+      type AgentEndAutoCaptureHook = {
+        (event: any, ctx: any): void;
+        __lastRun?: Promise<void>;
+      };
+
+      const agentEndAutoCaptureHook: AgentEndAutoCaptureHook = (event, ctx) => {
         if (!event.success || !event.messages || event.messages.length === 0) {
           return;
         }
 
+        // Fire-and-forget: run capture work in the background so the hook
+        // returns immediately and does not hold the session lock.  Blocking
+        // here causes downstream channel deliveries (e.g. Telegram) to be
+        // silently dropped when the session store lock times out.
+        // See: https://github.com/CortexReach/memory-lancedb-pro/issues/260
+        const backgroundRun = (async () => {
         try {
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
@@ -2448,7 +2494,12 @@ const memoryLanceDBProPlugin = {
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: capture failed: ${String(err)}`);
         }
-      });
+        })();
+        agentEndAutoCaptureHook.__lastRun = backgroundRun;
+        void backgroundRun;
+      };
+
+      api.on("agent_end", agentEndAutoCaptureHook);
     }
 
     // ========================================================================
