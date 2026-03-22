@@ -12,7 +12,7 @@ import {
   realpathSync,
   lstatSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
@@ -50,6 +50,19 @@ export interface MetadataPatch {
 
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null =
   null;
+
+// =========================================================================
+// Cross-Process File Lock (proper-lockfile)
+// =========================================================================
+
+let lockfileModule: any = null;
+
+async function loadLockfile(): Promise<any> {
+  if (!lockfileModule) {
+    lockfileModule = await import("proper-lockfile");
+  }
+  return lockfileModule;
+}
 
 export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
@@ -188,6 +201,20 @@ export class MemoryStore {
   private updateQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: StoreConfig) { }
+
+  private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    const lockfile = await loadLockfile();
+    const lockPath = join(this.config.dbPath, ".memory-write.lock");
+    if (!existsSync(lockPath)) {
+      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
+      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
+    }
+    const release = await lockfile.lock(lockPath, {
+      retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
+      stale: 10000,
+    });
+    try { return await fn(); } finally { await release(); }
+  }
 
   get dbPath(): string {
     return this.config.dbPath;
@@ -334,16 +361,18 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     };
 
-    try {
-      await this.table!.add([fullEntry]);
-    } catch (err: any) {
-      const code = err.code || "";
-      const message = err.message || String(err);
-      throw new Error(
-        `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
-      );
-    }
-    return fullEntry;
+    return this.runWithFileLock(async () => {
+      try {
+        await this.table!.add([fullEntry]);
+      } catch (err: any) {
+        const code = err.code || "";
+        const message = err.message || String(err);
+        throw new Error(
+          `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
+        );
+      }
+      return fullEntry;
+    });
   }
 
   /**
@@ -375,8 +404,10 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     };
 
-    await this.table!.add([full]);
-    return full;
+    return this.runWithFileLock(async () => {
+      await this.table!.add([full]);
+      return full;
+    });
   }
 
   async hasId(id: string): Promise<boolean> {
@@ -693,8 +724,10 @@ export class MemoryStore {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
 
-    await this.table!.delete(`id = '${resolvedId}'`);
-    return true;
+    return this.runWithFileLock(async () => {
+      await this.table!.delete(`id = '${resolvedId}'`);
+      return true;
+    });
   }
 
   async list(
@@ -818,7 +851,7 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runSerializedUpdate(async () => {
+    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
       // Support both full UUID and short prefix (8+ hex chars), same as delete()
       const uuidRegex =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -933,7 +966,7 @@ export class MemoryStore {
       }
 
       return updated;
-    });
+    }));
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
@@ -992,16 +1025,18 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    // Count first
-    const countResults = await this.table!.query().where(whereClause).toArray();
-    const deleteCount = countResults.length;
+    return this.runWithFileLock(async () => {
+      // Count first
+      const countResults = await this.table!.query().where(whereClause).toArray();
+      const deleteCount = countResults.length;
 
-    // Then delete
-    if (deleteCount > 0) {
-      await this.table!.delete(whereClause);
-    }
+      // Then delete
+      if (deleteCount > 0) {
+        await this.table!.delete(whereClause);
+      }
 
-    return deleteCount;
+      return deleteCount;
+    });
   }
 
   get hasFtsSupport(): boolean {

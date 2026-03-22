@@ -1698,6 +1698,27 @@ const memoryLanceDBProPlugin = {
       { decayEngine },
     );
     const scopeManager = createScopeManager(config.scopes);
+
+    // ClawTeam integration: extend accessible scopes via env var
+    const clawteamScopesRaw = process.env.CLAWTEAM_MEMORY_SCOPE;
+    if (clawteamScopesRaw) {
+      const extraScopes = clawteamScopesRaw.split(",").map(s => s.trim()).filter(Boolean);
+      for (const scope of extraScopes) {
+        if (!scopeManager.getScopeDefinition(scope)) {
+          scopeManager.addScopeDefinition(scope, { description: `CLAWTEAM_MEMORY_SCOPE env var: ${scope}` });
+        }
+      }
+      const originalGetAccessibleScopes = scopeManager.getAccessibleScopes.bind(scopeManager);
+      scopeManager.getAccessibleScopes = (agentId) => {
+        const base = originalGetAccessibleScopes(agentId);
+        for (const s of extraScopes) {
+          if (!base.includes(s)) base.push(s);
+        }
+        return base;
+      };
+      api.logger.info(`memory-lancedb-pro: CLAWTEAM_MEMORY_SCOPE added scopes: ${extraScopes.join(", ")}`);
+    }
+
     const migrator = createMigrator(store);
 
     // Initialize smart extraction
